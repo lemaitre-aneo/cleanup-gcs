@@ -20,7 +20,7 @@ impl Monitor {
             .with_style(
                 indicatif::ProgressStyle::with_template(
                 "{prefix} {bar} {pos}/{human_len} [{per_sec}] {elapsed}/{duration} ETA:{eta} Errors {errors}",
-            )?.with_key("errors", CounterProgressTracker::new(context.clone(), |c| c.listing_progress.error())));
+            )?.with_key("errors", CounterProgressTracker::new(context.clone(), |c| c.error_objects.get())));
 
         let transfer_count_progress = multi
             .add(ProgressBar::new(0))
@@ -31,7 +31,7 @@ impl Monitor {
                 )?
                 .with_key(
                     "errors",
-                    CounterProgressTracker::new(context.clone(), |c| c.transfer_count_progress.error()),
+                    CounterProgressTracker::new(context.clone(), |c| c.error_objects.get()),
                 ),
             );
 
@@ -52,13 +52,13 @@ impl Monitor {
                     .with_key(
                         "listing",
                         CounterProgressTracker::new(context.clone(), |c| {
-                            100 - c.listing_semaphore.available_permits()
+                            c.config.parallelism - c.delete_semaphore.available_permits()
                         }),
                     )
                     .with_key(
                         "transfers",
                         CounterProgressTracker::new(context.clone(), |c| {
-                            100 - c.transfer_semaphore.available_permits()
+                            c.config.parallelism - c.delete_semaphore.available_permits()
                         }),
                     ),
                 ),
@@ -82,14 +82,14 @@ impl Monitor {
     }
 
     fn update(&self) {
-        let listing_count = self.context.listing_progress.progress() as u64;
-        let listing_max = self.context.listing_progress.max() as u64;
+        let listing_count = self.context.live_objects.get() as u64;
+        let listing_max = self.context.objects.get() as u64;
 
-        let transfer_count_count = self.context.transfer_count_progress.progress() as u64;
-        let transfer_count_max = self.context.transfer_count_progress.max() as u64;
+        let transfer_count_count = self.context.live_objects.get() as u64;
+        let transfer_count_max = self.context.objects.get() as u64;
 
-        let transfer_bytes_count = self.context.transfer_bytes_progress.progress() as u64;
-        let transfer_bytes_max = self.context.transfer_bytes_progress.max() as u64;
+        let transfer_bytes_count = self.context.cum_live_bytes.get() as u64;
+        let transfer_bytes_max = self.context.cum_bytes.get() as u64;
 
         self.listing_progress.set_length(listing_max);
         self.transfer_count_progress.set_length(transfer_count_max);
@@ -101,7 +101,7 @@ impl Monitor {
         self.transfer_bytes_progress
             .set_position(transfer_bytes_count);
         self.instant_bytes
-            .set_position(self.context.instant_bytes.progress() as u64);
+            .set_position(self.context.cum_bytes.get() as u64);
     }
 }
 

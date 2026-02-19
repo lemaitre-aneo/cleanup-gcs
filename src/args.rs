@@ -30,10 +30,30 @@ pub struct Configuration {
     pub bucket: String,
 
     /// ID of the project
-    #[arg(short, long)]
+    #[arg(short = 'P', long, hide = true, default_value = "_")]
     pub project: String,
 
     /// URL for the GCP endpoint
     #[arg(short, long)]
     pub gcp_endpoint: Option<String>,
+
+    /// Parallelism for object deletion
+    #[arg(long, default_value_t = 1000)]
+    pub parallelism: usize,
+    
+    /// Do not perform any deletion
+    #[arg(short, long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Start listing at this object name
+    #[arg(short = 'S', long)]
+    pub start: Option<String>,
+
+    /// Stop listing at this object name
+    #[arg(short = 'E', long)]
+    pub end: Option<String>,
+    
+    /// List only objects whose name have this prefix
+    #[arg(short, long)]
+    pub prefix: Option<String>,
 }
