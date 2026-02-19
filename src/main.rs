@@ -148,15 +148,25 @@ async fn main() -> anyhow::Result<()> {
 }
 
 pub struct ExecutionContext {
+    /// Gcs client
     client: StorageControl,
+    /// Full name of the bucket
     bucket: String,
+    /// Configuration
     pub(crate) config: Configuration,
+    /// Number of objects that have been listed
     pub objects: Counter,
+    /// Number of live objects that have been listed
     pub live_objects: Counter,
+    /// Number of objects that have been deleted
     pub deleted_objects: Counter,
+    /// Number of objects whose deletion had an error
     pub error_objects: Counter,
+    /// Cumulative number of bytes for all the listed objects
     pub cum_bytes: Counter,
+    /// Cumulative number of bytes for all the listed and live objects
     pub cum_live_bytes: Counter,
+    /// Semaphore to limit the number of parallel deletion
     pub delete_semaphore: Arc<Semaphore>,
 }
 
@@ -209,13 +219,11 @@ impl ExecutionContext {
         let mut joiner = tokio::task::JoinSet::new();
 
         let mut last_object = scopeguard::guard(Object::new(), |object| {
-            if !object.name.is_empty() {
-                log::error!(
-                    "Listing stopped after object `{}#{}`",
-                    object.name,
-                    object.generation
-                );
-            }
+            log::error!(
+                "Listing stopped after object `{}`#{}",
+                object.name,
+                object.generation
+            );
         });
 
         while let Some(object) = listing.next().await {
@@ -224,7 +232,7 @@ impl ExecutionContext {
                     *last_object = object.clone();
                     if let Err(err) = self.process_object(object, &mut joiner).await {
                         log::error!(
-                            "Delete failed for object `{}#{}`: {err:?}",
+                            "Delete failed for object `{}`#{}: {err:?}",
                             last_object.name,
                             last_object.generation
                         );
@@ -232,7 +240,7 @@ impl ExecutionContext {
                 }
                 Err(err) => {
                     log::error!(
-                        "Listing failed after object `{}#{}`: {err:?}",
+                        "Listing failed after object `{}`#{}: {err:?}",
                         last_object.name,
                         last_object.generation
                     );
@@ -269,13 +277,13 @@ impl ExecutionContext {
         if object.delete_time.is_some() {
             let object = scopeguard::guard(object, |object| {
                 log::error!(
-                    "Deletion of object `{}#{}` has been cancelled",
+                    "Deletion of object `{}`#{} has been cancelled",
                     object.name,
                     object.generation
                 );
             });
 
-            log::debug!("Must delete {}#{}", object.name, object.generation);
+            log::debug!("Must delete `{}`#{}", object.name, object.generation);
             let ctx = Arc::clone(self);
             let sem_guard = self.delete_semaphore.clone().acquire_owned().await?;
             joiner.spawn(async move {
@@ -293,7 +301,7 @@ impl ExecutionContext {
                 {
                     let object = scopeguard::ScopeGuard::into_inner(object);
                     log::error!(
-                        "Failed to delete {}#{}: {err:?}",
+                        "Failed to delete `{}`#{}: {err:?}",
                         object.name,
                         object.generation
                     );
@@ -304,7 +312,7 @@ impl ExecutionContext {
                 let object = scopeguard::ScopeGuard::into_inner(object);
 
                 log::info!(
-                    "Deleted {}#{}{}",
+                    "Deleted `{}`#{}{}",
                     object.name,
                     object.generation,
                     ctx.dry_run_suffix()
@@ -313,7 +321,7 @@ impl ExecutionContext {
                 ctx.deleted_objects.inc();
             });
         } else {
-            log::debug!("Keep {}#{}", object.name, object.generation);
+            log::debug!("Keep `{}`#{}", object.name, object.generation);
             self.live_objects.inc();
             self.cum_bytes.add(object.size as usize);
         }
