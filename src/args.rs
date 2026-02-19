@@ -40,10 +40,14 @@ pub struct Configuration {
     /// Parallelism for object deletion
     #[arg(long, default_value_t = 1000)]
     pub parallelism: usize,
-    
+
     /// Do not perform any deletion
     #[arg(short, long, default_value_t = false)]
     pub dry_run: bool,
+
+    /// Fetch all metadata and print them on trace loglevel
+    #[arg(long, hide = true, default_value_t = false)]
+    pub fetch_all_metadata: bool,
 
     /// Start listing at this object name
     #[arg(short = 'S', long)]
@@ -52,7 +56,7 @@ pub struct Configuration {
     /// Stop listing at this object name
     #[arg(short = 'E', long)]
     pub end: Option<String>,
-    
+
     /// List only objects whose name have this prefix
     #[arg(short, long)]
     pub prefix: Option<String>,

@@ -95,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
 
     if let Ok(s) = ::std::env::var("RUST_LOG") {
         builder.parse_filters(&s);
+    } else {
+        builder.parse_filters("info");
     }
 
     let logger = builder.build();
@@ -198,13 +200,15 @@ impl ExecutionContext {
             .client
             .list_objects()
             .set_parent(&self.bucket)
-            .set_versions(true)
-            .set_read_mask(FieldMask::default().set_paths([
+            .set_versions(true);
+        if !self.config.fetch_all_metadata {
+            listing = listing.set_read_mask(FieldMask::default().set_paths([
                 "name",
                 "size",
                 "generation",
                 "delete_time",
-            ]));
+            ]))
+        }
         if let Some(prefix) = &self.config.prefix {
             listing = listing.set_prefix(prefix);
         }
@@ -273,6 +277,8 @@ impl ExecutionContext {
     ) -> anyhow::Result<()> {
         self.objects.inc();
         self.cum_bytes.add(object.size as usize);
+
+        log::trace!("Process {object:?}");
 
         if object.delete_time.is_some() {
             let object = scopeguard::guard(object, |object| {
