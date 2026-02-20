@@ -7,57 +7,78 @@ pub struct Monitor {
     multi: MultiProgress,
     listing_progress: ProgressBar,
     deletion_progress: ProgressBar,
+    object_progress: ProgressBar,
     bytes_progress: ProgressBar,
-    instant_status: ProgressBar,
     interval: tokio::time::Interval,
 }
 
 impl Monitor {
     pub fn new(context: Arc<ExecutionContext>, multi: MultiProgress) -> anyhow::Result<Self> {
-        let deletion_progress = multi
-            .add(ProgressBar::new(0))
-            .with_finish(indicatif::ProgressFinish::AndLeave)
-            .with_prefix("Delete")
-            .with_style(indicatif::ProgressStyle::with_template(
-                "{prefix:7} {bar} {pos}/{human_len} [{per_sec} objects/sec]",
-            )?);
         let listing_progress = multi
-            .add(ProgressBar::new(0))
+            .add(ProgressBar::new(1))
             .with_finish(indicatif::ProgressFinish::AndLeave)
             .with_prefix("Listing")
             .with_style(
                 indicatif::ProgressStyle::with_template(
-                    "{prefix:7} {spinner} {pos} objects, {live} live, {len} non-current [{per_sec}]",
+                    "{prefix:7} {bar} {pos}/{len}, {errors} errors [{per_sec}, ETA: {eta}, inflight: {inflight}/{parallelism}]",
                 )?
                 .with_key(
-                    "live",
-                    CounterProgressTracker::new(context.clone(), |c| c.live_objects.get()),
+                    "errors",
+                    CounterProgressTracker::new(context.clone(), |c| c.error_listings.get()),
+                )
+                .with_key(
+                    "inflight",
+                    CounterProgressTracker::new(context.clone(), |c| c.config.listings_parallelism - c.listing_semaphore.available_permits()),
+                )
+                .with_key(
+                    "parallelism",
+                    CounterProgressTracker::new(context.clone(), |c| c.config.listings_parallelism),
                 ),
             );
-
+        let deletion_progress = multi
+            .add(ProgressBar::new(0))
+            .with_finish(indicatif::ProgressFinish::AndLeave)
+            .with_prefix("Delete")
+            .with_style(
+                indicatif::ProgressStyle::with_template(
+                    "{prefix:7} {bar} {human_pos}/{human_len}, {errors} errors [{per_sec}, ETA: {eta}, inflight: {inflight}/{parallelism}]",
+                )?
+                .with_key(
+                    "errors",
+                    CounterProgressTracker::new(context.clone(), |c| c.error_objects.get()),
+                )
+                .with_key(
+                    "inflight",
+                    CounterProgressTracker::new(context.clone(), |c| c.config.deletes_parallelism - c.delete_semaphore.available_permits()),
+                )
+                .with_key(
+                    "parallelism",
+                    CounterProgressTracker::new(context.clone(), |c| c.config.deletes_parallelism),
+                ),
+            );
+        let object_progress = multi.add(
+            ProgressBar::new_spinner()
+                .with_finish(indicatif::ProgressFinish::AndLeave)
+                .with_prefix("Objects")
+                .with_style(
+                    indicatif::ProgressStyle::with_template(
+                        "{prefix:7} {spinner} {human_len} objects, {human_pos} live, {noncurrent} non-current [elapsed: {elapsed}]",
+                    )?
+                    .with_key(
+                        "noncurrent",
+                        CounterProgressTracker::new(context.clone(), |c| c.objects.get() - c.live_objects.get()),
+                    ),
+                ),
+        );
         let bytes_progress = multi
             .add(ProgressBar::new(0))
             .with_finish(indicatif::ProgressFinish::AndLeave)
             .with_prefix("Size")
             .with_style(indicatif::ProgressStyle::with_template(
-                "{prefix:7} {spinner} {bytes} total, {total_bytes} non-current",
+                "{prefix:7} {spinner} {total_bytes} total, {bytes} non-current [elapsed: {elapsed}]",
             )?);
 
-        let instant_status = multi.add(
-            ProgressBar::new_spinner()
-                .with_finish(indicatif::ProgressFinish::AndLeave)
-                .with_prefix("Status")
-                .with_style(
-                    indicatif::ProgressStyle::with_template(
-                        "{prefix:7} {spinner} {pos}/{len} in-flights, {errors} errors, {elapsed}",
-                    )?
-                    .with_key(
-                        "errors",
-                        CounterProgressTracker::new(context.clone(), |c| c.error_objects.get()),
-                    ),
-                ),
-        );
-        instant_status.set_length(context.config.deletes_parallelism as u64);
+        object_progress.set_length(context.config.deletes_parallelism as u64);
 
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -67,33 +88,30 @@ impl Monitor {
             multi,
             listing_progress,
             deletion_progress,
+            object_progress,
             bytes_progress,
-            instant_status,
             interval,
         })
     }
 
     fn update(&self) {
-        let total = self.context.objects.get() as u64;
-        let live = self.context.live_objects.get() as u64;
-        let deleted = self.context.deleted_objects.get() as u64;
-        let error = self.context.error_objects.get() as u64;
-        let total_bytes = self.context.cum_bytes.get() as u64;
-        let live_bytes = self.context.cum_live_bytes.get() as u64;
-        let available = self.context.delete_semaphore.available_permits() as u64;
-        let parallelism = self.context.config.deletes_parallelism as u64;
-        let in_flight = parallelism.saturating_sub(available);
-
-        self.listing_progress.set_position(total);
-        self.listing_progress.set_length(total - live);
-
-        self.bytes_progress.set_position(total_bytes);
-        self.bytes_progress.set_length(live_bytes);
-
-        self.deletion_progress.set_position(deleted);
-        self.deletion_progress.set_length(total - live - error);
-
-        self.instant_status.set_position(in_flight);
+        self.listing_progress.update(|state| {
+            state.set_pos(self.context.listings.get() as u64);
+            state.set_len(self.context.total_listings.get() as u64);
+        });
+        self.deletion_progress.update(|state| {
+            state.set_pos(self.context.deleted_objects.get() as u64);
+            state.set_len((self.context.objects.get() - self.context.live_objects.get()) as u64);
+        });
+        self.object_progress.update(|state| {
+            state.set_pos(self.context.live_objects.get() as u64);
+            state.set_len(self.context.objects.get() as u64);
+        });
+        self.bytes_progress.update(|state| {
+            let total = self.context.cum_bytes.get() as u64;
+            state.set_pos(total - self.context.cum_live_bytes.get() as u64);
+            state.set_len(total);
+        });
     }
 }
 
@@ -124,8 +142,8 @@ impl Drop for Monitor {
 
         self.multi.remove(&self.listing_progress);
         self.multi.remove(&self.deletion_progress);
+        self.multi.remove(&self.object_progress);
         self.multi.remove(&self.bytes_progress);
-        self.multi.remove(&self.instant_status);
     }
 }
 

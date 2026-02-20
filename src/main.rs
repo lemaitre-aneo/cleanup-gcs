@@ -1,4 +1,4 @@
-use std::{sync::Arc, usize};
+use std::sync::Arc;
 
 use clap::Parser;
 use google_cloud_gax::paginator::Paginator;
@@ -171,6 +171,12 @@ pub struct ExecutionContext {
     bucket: String,
     /// Configuration
     pub(crate) config: Configuration,
+    /// Number of listings that have finished
+    pub listings: Counter,
+    /// Total number of listings that have been planned
+    pub total_listings: Counter,
+    /// Number of listings that have failed
+    pub error_listings: Counter,
     /// Number of objects that have been listed
     pub objects: Counter,
     /// Number of live objects that have been listed
@@ -201,6 +207,9 @@ impl ExecutionContext {
         Ok(Self {
             client: storage_control,
             bucket: format!("projects/{}/buckets/{}", conf.project, conf.bucket),
+            listings: Default::default(),
+            total_listings: Default::default(),
+            error_listings: Default::default(),
             objects: Default::default(),
             live_objects: Default::default(),
             deleted_objects: Default::default(),
@@ -219,13 +228,12 @@ impl ExecutionContext {
     ) -> anyhow::Result<()> {
         let (listings_tx, mut listings_rx) =
             tokio::sync::mpsc::channel(self.config.listings_buffer);
-        listings_tx
-            .try_send(ListingRequest {
-                prefix: self.config.prefix.clone(),
-                depth: usize::try_from(self.config.tree_depth).unwrap_or(usize::MAX),
-                listings_tx: listings_tx.clone(),
-            })
-            .unwrap();
+        self.total_listings.inc();
+        listings_tx.try_send(ListingRequest {
+            prefix: self.config.prefix.clone(),
+            depth: usize::try_from(self.config.tree_depth).unwrap_or(usize::MAX),
+            listings_tx: listings_tx.clone(),
+        })?;
 
         std::mem::drop(listings_tx);
 
@@ -236,6 +244,7 @@ impl ExecutionContext {
             while let Some(tasks) = joiner.try_join_next() {
                 if let Err(err) = tasks {
                     log::error!("Could not join listing task: {err:?}");
+                    self.error_listings.inc();
                 }
             }
         }
@@ -243,6 +252,7 @@ impl ExecutionContext {
         while let Some(tasks) = joiner.join_next().await {
             if let Err(err) = tasks {
                 log::error!("Could not join listing task: {err:?}");
+                self.error_listings.inc();
             }
         }
 
@@ -302,6 +312,7 @@ impl ExecutionContext {
                         last_object.generation = 0;
                     }
                     for prefix in page.prefixes {
+                        self.total_listings.inc();
                         listing_request
                             .listings_tx
                             .send(ListingRequest {
@@ -323,7 +334,7 @@ impl ExecutionContext {
                         } else {
                             log::debug!("Live object `{}`#{}", object.name, object.generation);
                             self.live_objects.inc();
-                            self.cum_bytes.add(object.size as usize);
+                            self.cum_live_bytes.add(object.size as usize);
                         }
                     }
                 }
@@ -333,11 +344,13 @@ impl ExecutionContext {
                         last_object.name,
                         last_object.generation
                     );
+                    self.error_listings.inc();
                 }
             }
         }
 
         scopeguard::ScopeGuard::into_inner(last_object);
+        self.listings.inc();
     }
 
     pub async fn run_delete(
@@ -348,11 +361,12 @@ impl ExecutionContext {
 
         while let Some(object) = rx.recv().await {
             let sem_guard = self.delete_semaphore.clone().acquire_owned().await?;
-            joiner.spawn(Arc::clone(&self).process_object(object, sem_guard));
+            joiner.spawn(Arc::clone(&self).delete_object(object, sem_guard));
 
             while let Some(tasks) = joiner.try_join_next() {
                 if let Err(err) = tasks {
                     log::error!("Could not join delete task: {err:?}");
+                    self.error_objects.inc();
                 }
             }
         }
@@ -360,6 +374,7 @@ impl ExecutionContext {
         while let Some(tasks) = joiner.join_next().await {
             if let Err(err) = tasks {
                 log::error!("Could not join delete task: {err:?}");
+                self.error_objects.inc();
             }
         }
 
@@ -368,12 +383,12 @@ impl ExecutionContext {
         Ok(())
     }
 
-    async fn process_object(
+    async fn delete_object(
         self: Arc<Self>,
         object: Box<Object>,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        log::debug!("Must delete `{}`#{}", object.name, object.generation);
+        log::debug!("Deleting `{}`#{}", object.name, object.generation);
 
         let object = scopeguard::guard(object, |object| {
             log::error!(
