@@ -37,9 +37,21 @@ pub struct Configuration {
     #[arg(short, long)]
     pub gcp_endpoint: Option<String>,
 
-    /// Parallelism for object deletion
-    #[arg(long, default_value_t = 1000)]
-    pub parallelism: usize,
+    /// Max number of concurrent listings
+    #[arg(short = 'l', long, default_value_t = 100)]
+    pub listings_parallelism: usize,
+
+    /// Max number of concurrent deletes
+    #[arg(short = 'n', long, default_value_t = 1000)]
+    pub deletes_parallelism: usize,
+
+    /// Max number of concurrent listings
+    #[arg(short = 'L', long, default_value_t = 10000)]
+    pub listings_buffer: usize,
+
+    /// Max number of concurrent deletes
+    #[arg(short = 'N', long, default_value_t = 100000)]
+    pub deletes_buffer: usize,
 
     /// Do not perform any deletion
     #[arg(short, long, default_value_t = false)]
@@ -60,4 +72,8 @@ pub struct Configuration {
     /// List only objects whose name have this prefix
     #[arg(short, long)]
     pub prefix: Option<String>,
+
+    /// Parallelize listings up to given depth
+    #[arg(short, long, default_value_t = 0)]
+    pub tree_depth: i64,
 }

@@ -57,7 +57,7 @@ impl Monitor {
                     ),
                 ),
         );
-        instant_status.set_length(context.config.parallelism as u64);
+        instant_status.set_length(context.config.deletes_parallelism as u64);
 
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -81,7 +81,7 @@ impl Monitor {
         let total_bytes = self.context.cum_bytes.get() as u64;
         let live_bytes = self.context.cum_live_bytes.get() as u64;
         let available = self.context.delete_semaphore.available_permits() as u64;
-        let parallelism = self.context.config.parallelism as u64;
+        let parallelism = self.context.config.deletes_parallelism as u64;
         let in_flight = parallelism.saturating_sub(available);
 
         self.listing_progress.set_position(total);

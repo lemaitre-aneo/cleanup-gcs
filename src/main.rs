@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{sync::Arc, usize};
 
 use clap::Parser;
-use google_cloud_gax::paginator::ItemPaginator;
+use google_cloud_gax::paginator::Paginator;
 use google_cloud_storage::{client::StorageControl, model::Object};
 use google_cloud_wkt::FieldMask;
 use indicatif::MultiProgress;
@@ -105,17 +105,26 @@ async fn main() -> anyhow::Result<()> {
     LogWrapper::new(multi.clone(), logger).try_init()?;
     log::set_max_level(level);
 
+    let (tx, rx) = tokio::sync::mpsc::channel(args.deletes_buffer);
     let execution_context = Arc::new(ExecutionContext::new(args).await?);
 
-    let mut listings = tokio::spawn(execution_context.clone().run());
+    let mut listings = tokio::spawn(execution_context.clone().run_listing(tx));
+    let mut deletes = tokio::spawn(execution_context.clone().run_delete(rx));
     let monitoring = tokio::spawn(Monitor::new(execution_context.clone(), multi.clone())?);
 
+    let run = async { tokio::join!(&mut listings, &mut deletes) };
+
     tokio::select! {
-        listings = &mut listings => {
+        (listings, deletes) = run => {
             match listings {
                 Ok(Ok(())) => (),
                 Ok(Err(err)) => log::error!("Listing error: {err:?}"),
                 Err(err) => log::error!("Listing error: {err:?}"),
+            }
+            match deletes {
+                Ok(Ok(())) => (),
+                Ok(Err(err)) => log::error!("Delete error: {err:?}"),
+                Err(err) => log::error!("Delete error: {err:?}"),
             }
         }
         _ = wait_terminate() => {
@@ -149,6 +158,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+struct ListingRequest {
+    prefix: Option<String>,
+    depth: usize,
+    listings_tx: tokio::sync::mpsc::Sender<ListingRequest>,
+}
+
 pub struct ExecutionContext {
     /// Gcs client
     client: StorageControl,
@@ -168,6 +183,8 @@ pub struct ExecutionContext {
     pub cum_bytes: Counter,
     /// Cumulative number of bytes for all the listed and live objects
     pub cum_live_bytes: Counter,
+    /// Semaphore to limit the number of parallel listing
+    pub listing_semaphore: Arc<Semaphore>,
     /// Semaphore to limit the number of parallel deletion
     pub delete_semaphore: Arc<Semaphore>,
 }
@@ -190,12 +207,53 @@ impl ExecutionContext {
             error_objects: Default::default(),
             cum_bytes: Default::default(),
             cum_live_bytes: Default::default(),
-            delete_semaphore: Arc::new(Semaphore::const_new(conf.parallelism)),
+            listing_semaphore: Arc::new(Semaphore::const_new(conf.listings_parallelism)),
+            delete_semaphore: Arc::new(Semaphore::const_new(conf.deletes_parallelism)),
             config: conf,
         })
     }
 
-    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
+    pub async fn run_listing(
+        self: Arc<Self>,
+        objects_tx: tokio::sync::mpsc::Sender<Box<Object>>,
+    ) -> anyhow::Result<()> {
+        let (listings_tx, mut listings_rx) =
+            tokio::sync::mpsc::channel(self.config.listings_buffer);
+        listings_tx
+            .try_send(ListingRequest {
+                prefix: self.config.prefix.clone(),
+                depth: usize::try_from(self.config.tree_depth).unwrap_or(usize::MAX),
+                listings_tx: listings_tx.clone(),
+            })
+            .unwrap();
+
+        std::mem::drop(listings_tx);
+
+        let mut joiner = tokio::task::JoinSet::new();
+        while let Some(request) = listings_rx.recv().await {
+            joiner.spawn(Arc::clone(&self).list(request, objects_tx.clone()));
+
+            while let Some(tasks) = joiner.try_join_next() {
+                if let Err(err) = tasks {
+                    log::error!("Could not join listing task: {err:?}");
+                }
+            }
+        }
+
+        while let Some(tasks) = joiner.join_next().await {
+            if let Err(err) = tasks {
+                log::error!("Could not join listing task: {err:?}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn list(
+        self: Arc<Self>,
+        listing_request: ListingRequest,
+        objects_tx: tokio::sync::mpsc::Sender<Box<Object>>,
+    ) {
         let mut listing = self
             .client
             .list_objects()
@@ -209,8 +267,13 @@ impl ExecutionContext {
                 "delete_time",
             ]))
         }
-        if let Some(prefix) = &self.config.prefix {
+        if let Some(prefix) = &listing_request.prefix {
             listing = listing.set_prefix(prefix);
+        }
+        if listing_request.depth > 0 {
+            listing = listing
+                .set_delimiter("/")
+                .set_include_folders_as_prefixes(false);
         }
         if let Some(start) = &self.config.start {
             listing = listing.set_lexicographic_start(start);
@@ -218,10 +281,8 @@ impl ExecutionContext {
         if let Some(end) = &self.config.end {
             listing = listing.set_lexicographic_end(end);
         }
-        let mut listing = listing.by_item();
 
-        let mut joiner = tokio::task::JoinSet::new();
-
+        let mut listing = listing.by_page();
         let mut last_object = scopeguard::guard(Object::new(), |object| {
             log::error!(
                 "Listing stopped after object `{}`#{}",
@@ -230,16 +291,40 @@ impl ExecutionContext {
             );
         });
 
-        while let Some(object) = listing.next().await {
-            match object {
-                Ok(object) => {
-                    *last_object = object.clone();
-                    if let Err(err) = self.process_object(object, &mut joiner).await {
-                        log::error!(
-                            "Delete failed for object `{}`#{}: {err:?}",
-                            last_object.name,
-                            last_object.generation
-                        );
+        while let Some(page) = listing.next().await {
+            log::trace!("Received listing page: {page:?}");
+            match page {
+                Ok(page) => {
+                    if let Some(last) = page.objects.last() {
+                        *last_object = last.clone();
+                    } else if let Some(last) = page.prefixes.last() {
+                        last_object.name = last.clone();
+                        last_object.generation = 0;
+                    }
+                    for prefix in page.prefixes {
+                        listing_request
+                            .listings_tx
+                            .send(ListingRequest {
+                                prefix: Some(prefix),
+                                depth: listing_request.depth.saturating_sub(1),
+                                listings_tx: listing_request.listings_tx.clone(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    for object in page.objects {
+                        self.objects.inc();
+                        self.cum_bytes.add(object.size as usize);
+
+                        if object.delete_time.is_some() {
+                            log::debug!("Non-current `{}`#{}", object.name, object.generation);
+
+                            objects_tx.send(Box::new(object)).await.unwrap();
+                        } else {
+                            log::debug!("Live object `{}`#{}", object.name, object.generation);
+                            self.live_objects.inc();
+                            self.cum_bytes.add(object.size as usize);
+                        }
                     }
                 }
                 Err(err) => {
@@ -250,6 +335,20 @@ impl ExecutionContext {
                     );
                 }
             }
+        }
+
+        scopeguard::ScopeGuard::into_inner(last_object);
+    }
+
+    pub async fn run_delete(
+        self: Arc<Self>,
+        mut rx: tokio::sync::mpsc::Receiver<Box<Object>>,
+    ) -> anyhow::Result<()> {
+        let mut joiner = tokio::task::JoinSet::new();
+
+        while let Some(object) = rx.recv().await {
+            let sem_guard = self.delete_semaphore.clone().acquire_owned().await?;
+            joiner.spawn(Arc::clone(&self).process_object(object, sem_guard));
 
             while let Some(tasks) = joiner.try_join_next() {
                 if let Err(err) = tasks {
@@ -258,81 +357,62 @@ impl ExecutionContext {
             }
         }
 
-        scopeguard::ScopeGuard::into_inner(last_object);
-
-        log::debug!("Listing finished",);
-
         while let Some(tasks) = joiner.join_next().await {
             if let Err(err) = tasks {
                 log::error!("Could not join delete task: {err:?}");
             }
         }
+
+        log::debug!("Delete finished",);
+
         Ok(())
     }
 
     async fn process_object(
-        self: &Arc<Self>,
-        object: Object,
-        joiner: &mut tokio::task::JoinSet<()>,
-    ) -> anyhow::Result<()> {
-        self.objects.inc();
-        self.cum_bytes.add(object.size as usize);
+        self: Arc<Self>,
+        object: Box<Object>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        log::debug!("Must delete `{}`#{}", object.name, object.generation);
 
-        log::trace!("Process {object:?}");
+        let object = scopeguard::guard(object, |object| {
+            log::error!(
+                "Deletion of object `{}`#{} has been cancelled",
+                object.name,
+                object.generation
+            );
+        });
 
-        if object.delete_time.is_some() {
-            let object = scopeguard::guard(object, |object| {
-                log::error!(
-                    "Deletion of object `{}`#{} has been cancelled",
-                    object.name,
-                    object.generation
-                );
-            });
-
-            log::debug!("Must delete `{}`#{}", object.name, object.generation);
-            let ctx = Arc::clone(self);
-            let sem_guard = self.delete_semaphore.clone().acquire_owned().await?;
-            joiner.spawn(async move {
-                let _sem_guard = sem_guard;
-
-                if !ctx.config.dry_run
-                    && let Err(err) = ctx
-                        .client
-                        .delete_object()
-                        .set_bucket(&ctx.bucket)
-                        .set_object(&object.name)
-                        .set_generation(object.generation)
-                        .send()
-                        .await
-                {
-                    let object = scopeguard::ScopeGuard::into_inner(object);
-                    log::error!(
-                        "Failed to delete `{}`#{}: {err:?}",
-                        object.name,
-                        object.generation
-                    );
-                    ctx.error_objects.inc();
-                    return;
-                }
-
-                let object = scopeguard::ScopeGuard::into_inner(object);
-
-                log::info!(
-                    "Deleted `{}`#{}{}",
-                    object.name,
-                    object.generation,
-                    ctx.dry_run_suffix()
-                );
-
-                ctx.deleted_objects.inc();
-            });
-        } else {
-            log::debug!("Keep `{}`#{}", object.name, object.generation);
-            self.live_objects.inc();
-            self.cum_bytes.add(object.size as usize);
+        if !self.config.dry_run
+            && let Err(err) = self
+                .client
+                .delete_object()
+                .set_bucket(&self.bucket)
+                .set_object(&object.name)
+                .set_generation(object.generation)
+                .send()
+                .await
+        {
+            let object = scopeguard::ScopeGuard::into_inner(object);
+            log::error!(
+                "Failed to delete `{}`#{}: {err:?}",
+                object.name,
+                object.generation
+            );
+            self.error_objects.inc();
+            return;
         }
 
-        Ok(())
+        let object = scopeguard::ScopeGuard::into_inner(object);
+
+        log::info!(
+            "Deleted `{}`#{}{}",
+            object.name,
+            object.generation,
+            self.dry_run_suffix()
+        );
+
+        self.deleted_objects.inc();
     }
 
     fn dry_run_suffix(&self) -> &str {
