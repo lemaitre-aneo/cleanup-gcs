@@ -3,7 +3,7 @@ use std::sync::Arc;
 use clap::Parser;
 use google_cloud_gax::paginator::Paginator;
 use google_cloud_storage::{client::StorageControl, model::Object};
-use google_cloud_wkt::FieldMask;
+use google_cloud_wkt::{FieldMask, Timestamp};
 use indicatif::MultiProgress;
 use indicatif_log_bridge::LogWrapper;
 use tokio::sync::Semaphore;
@@ -178,6 +178,23 @@ struct ListingRequest {
     listings_tx: tokio::sync::mpsc::Sender<ListingRequest>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DeleteRequest {
+    name: String,
+    generation: i64,
+    delete_time: Option<Timestamp>,
+}
+
+impl From<Object> for DeleteRequest {
+    fn from(object: Object) -> Self {
+        Self {
+            name: object.name,
+            generation: object.generation,
+            delete_time: object.delete_time,
+        }
+    }
+}
+
 pub struct ExecutionContext {
     /// Gcs client
     client: StorageControl,
@@ -238,7 +255,7 @@ impl ExecutionContext {
 
     pub async fn run_listing(
         self: Arc<Self>,
-        objects_tx: tokio::sync::mpsc::Sender<Box<Object>>,
+        objects_tx: tokio::sync::mpsc::Sender<DeleteRequest>,
     ) -> anyhow::Result<()> {
         let (listings_tx, mut listings_rx) =
             tokio::sync::mpsc::channel(self.config.listings_buffer);
@@ -277,7 +294,7 @@ impl ExecutionContext {
     async fn list(
         self: Arc<Self>,
         listing_request: ListingRequest,
-        objects_tx: tokio::sync::mpsc::Sender<Box<Object>>,
+        objects_tx: tokio::sync::mpsc::Sender<DeleteRequest>,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let mut listing = self
@@ -309,7 +326,7 @@ impl ExecutionContext {
         }
 
         let mut listing = listing.by_page();
-        let mut last_object = scopeguard::guard(Object::new(), |object| {
+        let mut last_object = scopeguard::guard(DeleteRequest::default(), |object| {
             log::error!(
                 "Listing stopped after object `{}`#{}",
                 object.name,
@@ -322,7 +339,7 @@ impl ExecutionContext {
             match page {
                 Ok(page) => {
                     if let Some(last) = page.objects.last() {
-                        *last_object = last.clone();
+                        *last_object = last.clone().into();
                     } else if let Some(last) = page.prefixes.last() {
                         last_object.name = last.clone();
                         last_object.generation = 0;
@@ -346,7 +363,7 @@ impl ExecutionContext {
                         if object.delete_time.is_some() {
                             log::debug!("Non-current `{}`#{}", object.name, object.generation);
 
-                            objects_tx.send(Box::new(object)).await.unwrap();
+                            objects_tx.send(object.into()).await.unwrap();
                         } else {
                             log::debug!("Live object `{}`#{}", object.name, object.generation);
                             self.live_objects.inc();
@@ -371,7 +388,7 @@ impl ExecutionContext {
 
     pub async fn run_delete(
         self: Arc<Self>,
-        mut rx: tokio::sync::mpsc::Receiver<Box<Object>>,
+        mut rx: tokio::sync::mpsc::Receiver<DeleteRequest>,
     ) -> anyhow::Result<()> {
         let mut joiner = tokio::task::JoinSet::new();
 
@@ -401,9 +418,18 @@ impl ExecutionContext {
 
     async fn delete_object(
         self: Arc<Self>,
-        object: Box<Object>,
+        object: DeleteRequest,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
+        if object.delete_time.is_none() {
+            log::error!(
+                "ASSERT FAILED: Object `{}`#{} is not a non-current version, skipping deletion",
+                object.name,
+                object.generation
+            );
+            self.error_objects.inc();
+            return;
+        }
         log::debug!(
             "Deleting `{}`#{}{}",
             object.name,
