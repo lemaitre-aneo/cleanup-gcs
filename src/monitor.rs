@@ -63,8 +63,12 @@ impl Monitor {
                 .with_prefix("Objects")
                 .with_style(
                     indicatif::ProgressStyle::with_template(
-                        "{prefix:7} {spinner} {human_len} objects, {human_pos} live, {noncurrent} non-current [elapsed: {elapsed}]",
+                        "{prefix:7} {spinner} {human_pos} objects, {live} live, {noncurrent} non-current [{per_sec}, elapsed: {elapsed}]",
                     )?
+                    .with_key(
+                        "live",
+                        CounterProgressTracker::new(context.clone(), |c| c.live_objects.get()),
+                    )
                     .with_key(
                         "noncurrent",
                         CounterProgressTracker::new(context.clone(), |c| c.objects.get() - c.live_objects.get()),
@@ -107,8 +111,7 @@ impl Monitor {
             state.set_len((self.context.objects.get() - self.context.live_objects.get()) as u64);
         });
         self.object_progress.update(|state| {
-            state.set_pos(self.context.live_objects.get() as u64);
-            state.set_len(self.context.objects.get() as u64);
+            state.set_pos(self.context.objects.get() as u64);
         });
         self.bytes_progress.update(|state| {
             let total = self.context.cum_bytes.get() as u64;

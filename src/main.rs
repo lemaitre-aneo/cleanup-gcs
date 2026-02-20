@@ -239,7 +239,8 @@ impl ExecutionContext {
 
         let mut joiner = tokio::task::JoinSet::new();
         while let Some(request) = listings_rx.recv().await {
-            joiner.spawn(Arc::clone(&self).list(request, objects_tx.clone()));
+            let permit = self.listing_semaphore.clone().acquire_owned().await?;
+            joiner.spawn(Arc::clone(&self).list(request, objects_tx.clone(), permit));
 
             while let Some(tasks) = joiner.try_join_next() {
                 if let Err(err) = tasks {
@@ -263,6 +264,7 @@ impl ExecutionContext {
         self: Arc<Self>,
         listing_request: ListingRequest,
         objects_tx: tokio::sync::mpsc::Sender<Box<Object>>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let mut listing = self
             .client
@@ -360,8 +362,8 @@ impl ExecutionContext {
         let mut joiner = tokio::task::JoinSet::new();
 
         while let Some(object) = rx.recv().await {
-            let sem_guard = self.delete_semaphore.clone().acquire_owned().await?;
-            joiner.spawn(Arc::clone(&self).delete_object(object, sem_guard));
+            let permit = self.delete_semaphore.clone().acquire_owned().await?;
+            joiner.spawn(Arc::clone(&self).delete_object(object, permit));
 
             while let Some(tasks) = joiner.try_join_next() {
                 if let Err(err) = tasks {
