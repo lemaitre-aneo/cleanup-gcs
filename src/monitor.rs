@@ -39,9 +39,10 @@ impl Monitor {
             .add(ProgressBar::new(0))
             .with_finish(indicatif::ProgressFinish::AndLeave)
             .with_prefix("Delete")
+            .with_message(context.dry_run_suffix().to_string())
             .with_style(
                 indicatif::ProgressStyle::with_template(
-                    "{prefix:7} {bar} {human_pos}/{human_len}, {errors} errors [{per_sec}, ETA: {eta}, inflight: {inflight}/{parallelism}]",
+                    "{prefix:7} {bar} {human_pos}/{human_len}, {errors} errors [{per_sec}, ETA: {eta}, inflight: {inflight}/{parallelism}]{msg}",
                 )?
                 .with_key(
                     "errors",

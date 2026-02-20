@@ -388,7 +388,12 @@ impl ExecutionContext {
         object: Box<Object>,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        log::debug!("Deleting `{}`#{}", object.name, object.generation);
+        log::debug!(
+            "Deleting `{}`#{}{}",
+            object.name,
+            object.generation,
+            self.dry_run_suffix()
+        );
 
         let object = scopeguard::guard(object, |object| {
             log::error!(
@@ -411,9 +416,10 @@ impl ExecutionContext {
                     if perms.permissions.is_empty() {
                         let object = scopeguard::ScopeGuard::into_inner(object);
                         log::error!(
-                            "Failed to delete `{}`#{}: Not authorized",
+                            "Failed to delete `{}`#{}{}: Not authorized",
                             object.name,
-                            object.generation
+                            object.generation,
+                            self.dry_run_suffix(),
                         );
                         self.error_objects.inc();
                         return;
@@ -422,9 +428,10 @@ impl ExecutionContext {
                 Err(err) => {
                     let object = scopeguard::ScopeGuard::into_inner(object);
                     log::error!(
-                        "Failed to delete `{}`#{}: {err}",
+                        "Failed to delete `{}`#{}{}: {err}",
                         object.name,
-                        object.generation
+                        object.generation,
+                        self.dry_run_suffix(),
                     );
                     self.error_objects.inc();
                     return;
