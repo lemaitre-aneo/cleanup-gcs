@@ -108,14 +108,17 @@ async fn main() -> anyhow::Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel(args.deletes_buffer);
     let execution_context = Arc::new(ExecutionContext::new(args).await?);
 
-    let mut listings = tokio::spawn(execution_context.clone().run_listing(tx));
-    let mut deletes = tokio::spawn(execution_context.clone().run_delete(rx));
+    let listings = tokio::spawn(execution_context.clone().run_listing(tx));
+    let deletes = tokio::spawn(execution_context.clone().run_delete(rx));
     let monitoring = tokio::spawn(Monitor::new(execution_context.clone(), multi.clone())?);
 
-    let run = async { tokio::join!(&mut listings, &mut deletes) };
+    let listings_abort = listings.abort_handle();
+    let deletes_abort = deletes.abort_handle();
+
+    let mut run = std::pin::pin!(async { tokio::join!(listings, deletes) });
 
     tokio::select! {
-        (listings, deletes) = run => {
+        (listings, deletes) = &mut run => {
             match listings {
                 Ok(Ok(())) => (),
                 Ok(Err(err)) => log::error!("Listing error: {err}"),
@@ -129,13 +132,24 @@ async fn main() -> anyhow::Result<()> {
         }
         _ = wait_terminate() => {
             tracing::error!("Application stopping");
-            listings.abort();
-            match listings.await {
+            listings_abort.abort();
+            deletes_abort.abort();
+            let (listings, deletes) = run.await;
+            match listings {
                 Ok(Ok(())) => (),
                 Ok(Err(err)) => log::error!("Listing error: {err}"),
                 Err(err) => {
                     if !err.is_cancelled() {
                         log::error!("Listing error: {err}");
+                    }
+                }
+            }
+            match deletes {
+                Ok(Ok(())) => (),
+                Ok(Err(err)) => log::error!("Delete error: {err}"),
+                Err(err) => {
+                    if !err.is_cancelled() {
+                        log::error!("Delete error: {err}");
                     }
                 }
             }
