@@ -96,11 +96,13 @@ impl Monitor {
 
     fn update(&self) {
         self.listing_progress.update(|state| {
-            state.set_pos(self.context.listings.get() as u64);
+            state.set_pos((self.context.listings.get() + self.context.error_listings.get()) as u64);
             state.set_len(self.context.total_listings.get() as u64);
         });
         self.deletion_progress.update(|state| {
-            state.set_pos(self.context.deleted_objects.get() as u64);
+            state.set_pos(
+                (self.context.deleted_objects.get() + self.context.error_objects.get()) as u64,
+            );
             state.set_len((self.context.objects.get() - self.context.live_objects.get()) as u64);
         });
         self.object_progress.update(|state| {

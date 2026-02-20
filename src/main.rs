@@ -118,13 +118,13 @@ async fn main() -> anyhow::Result<()> {
         (listings, deletes) = run => {
             match listings {
                 Ok(Ok(())) => (),
-                Ok(Err(err)) => log::error!("Listing error: {err:?}"),
-                Err(err) => log::error!("Listing error: {err:?}"),
+                Ok(Err(err)) => log::error!("Listing error: {err}"),
+                Err(err) => log::error!("Listing error: {err}"),
             }
             match deletes {
                 Ok(Ok(())) => (),
-                Ok(Err(err)) => log::error!("Delete error: {err:?}"),
-                Err(err) => log::error!("Delete error: {err:?}"),
+                Ok(Err(err)) => log::error!("Delete error: {err}"),
+                Err(err) => log::error!("Delete error: {err}"),
             }
         }
         _ = wait_terminate() => {
@@ -132,10 +132,10 @@ async fn main() -> anyhow::Result<()> {
             listings.abort();
             match listings.await {
                 Ok(Ok(())) => (),
-                Ok(Err(err)) => log::error!("Listing error: {err:?}"),
+                Ok(Err(err)) => log::error!("Listing error: {err}"),
                 Err(err) => {
                     if !err.is_cancelled() {
-                        log::error!("Listing error: {err:?}");
+                        log::error!("Listing error: {err}");
                     }
                 }
             }
@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(_) => (),
         Err(err) => {
             if !err.is_cancelled() {
-                log::error!("Monitor error: {err:?}");
+                log::error!("Monitor error: {err}");
             }
         }
     }
@@ -243,7 +243,7 @@ impl ExecutionContext {
 
             while let Some(tasks) = joiner.try_join_next() {
                 if let Err(err) = tasks {
-                    log::error!("Could not join listing task: {err:?}");
+                    log::error!("Could not join listing task: {err}");
                     self.error_listings.inc();
                 }
             }
@@ -251,7 +251,7 @@ impl ExecutionContext {
 
         while let Some(tasks) = joiner.join_next().await {
             if let Err(err) = tasks {
-                log::error!("Could not join listing task: {err:?}");
+                log::error!("Could not join listing task: {err}");
                 self.error_listings.inc();
             }
         }
@@ -340,7 +340,7 @@ impl ExecutionContext {
                 }
                 Err(err) => {
                     log::error!(
-                        "Listing failed after object `{}`#{}: {err:?}",
+                        "Listing failed after object `{}`#{}: {err}",
                         last_object.name,
                         last_object.generation
                     );
@@ -365,7 +365,7 @@ impl ExecutionContext {
 
             while let Some(tasks) = joiner.try_join_next() {
                 if let Err(err) = tasks {
-                    log::error!("Could not join delete task: {err:?}");
+                    log::error!("Could not join delete task: {err}");
                     self.error_objects.inc();
                 }
             }
@@ -373,7 +373,7 @@ impl ExecutionContext {
 
         while let Some(tasks) = joiner.join_next().await {
             if let Err(err) = tasks {
-                log::error!("Could not join delete task: {err:?}");
+                log::error!("Could not join delete task: {err}");
                 self.error_objects.inc();
             }
         }
@@ -398,19 +398,50 @@ impl ExecutionContext {
             );
         });
 
-        if !self.config.dry_run
-            && let Err(err) = self
+        if self.config.dry_run {
+            match self
                 .client
-                .delete_object()
-                .set_bucket(&self.bucket)
-                .set_object(&object.name)
-                .set_generation(object.generation)
+                .test_iam_permissions()
+                .set_resource(&self.bucket)
+                .set_permissions(["storage.objects.delete"])
                 .send()
                 .await
+            {
+                Ok(perms) => {
+                    if perms.permissions.is_empty() {
+                        let object = scopeguard::ScopeGuard::into_inner(object);
+                        log::error!(
+                            "Failed to delete `{}`#{}: Not authorized",
+                            object.name,
+                            object.generation
+                        );
+                        self.error_objects.inc();
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let object = scopeguard::ScopeGuard::into_inner(object);
+                    log::error!(
+                        "Failed to delete `{}`#{}: {err}",
+                        object.name,
+                        object.generation
+                    );
+                    self.error_objects.inc();
+                    return;
+                }
+            }
+        } else if let Err(err) = self
+            .client
+            .delete_object()
+            .set_bucket(&self.bucket)
+            .set_object(&object.name)
+            .set_generation(object.generation)
+            .send()
+            .await
         {
             let object = scopeguard::ScopeGuard::into_inner(object);
             log::error!(
-                "Failed to delete `{}`#{}: {err:?}",
+                "Failed to delete `{}`#{}: {err}",
                 object.name,
                 object.generation
             );
