@@ -327,15 +327,19 @@ impl ExecutionContext {
 
         let mut listing = listing.by_page();
         let mut last_object = scopeguard::guard(DeleteRequest::default(), |object| {
-            log::error!(
-                "Listing stopped after object `{}`#{}",
+            log::warn!(
+                "Listing for prefix `{}` cancelled. Last object fetched `{}`#{}",
+                listing_request.prefix.as_deref().unwrap_or(""),
                 object.name,
                 object.generation
             );
         });
 
         while let Some(page) = listing.next().await {
-            log::trace!("Received listing page: {page:?}");
+            log::trace!(
+                "Received listing page for prefix `{}`: {page:?}",
+                listing_request.prefix.as_deref().unwrap_or(""),
+            );
             match page {
                 Ok(page) => {
                     if let Some(last) = page.objects.last() {
@@ -373,7 +377,8 @@ impl ExecutionContext {
                 }
                 Err(err) => {
                     log::error!(
-                        "Listing failed after object `{}`#{}: {err}",
+                        "Listing with prefix `{}` failed after object `{}`#{}: {err}",
+                        listing_request.prefix.as_deref().unwrap_or(""),
                         last_object.name,
                         last_object.generation
                     );
@@ -438,7 +443,7 @@ impl ExecutionContext {
         );
 
         let object = scopeguard::guard(object, |object| {
-            log::error!(
+            log::warn!(
                 "Deletion of object `{}`#{} has been cancelled",
                 object.name,
                 object.generation
