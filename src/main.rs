@@ -423,6 +423,9 @@ impl ExecutionContext {
                         last_object.generation
                     );
                     self.error_listings.inc();
+
+                    scopeguard::ScopeGuard::into_inner(last_object);
+                    return;
                 }
             }
         }
