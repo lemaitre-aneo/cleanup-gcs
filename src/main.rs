@@ -284,10 +284,34 @@ impl ExecutionContext {
 
         std::mem::drop(listings_tx);
 
+        let mut requests = Vec::new();
         let mut joiner = tokio::task::JoinSet::new();
-        while let Some(request) = listings_rx.recv().await {
-            let permit = self.listing_semaphore.clone().acquire_owned().await?;
-            joiner.spawn(Arc::clone(&self).list(request, objects_tx.clone(), permit));
+        let mut acquire_onflight = None;
+
+        loop {
+            let acquire = acquire_onflight
+                .get_or_insert_with(|| self.listing_semaphore.clone().acquire_owned());
+            let acquire = unsafe { std::pin::Pin::new_unchecked(acquire) };
+
+            tokio::select! {
+                Some(request) = listings_rx.recv() => {
+                    requests.push(request);
+                    continue;
+                }
+
+                permit = acquire, if !requests.is_empty() => {
+                    acquire_onflight = None;
+                    match permit {
+                        Ok(permit) => {
+                            let listing = requests.swap_remove(rand::random::<u64>() as usize % requests.len());
+                            joiner.spawn(Arc::clone(&self).list(listing, objects_tx.clone(), permit));
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+
+                else => break,
+            }
 
             while let Some(tasks) = joiner.try_join_next() {
                 if let Err(err) = tasks {
@@ -411,11 +435,33 @@ impl ExecutionContext {
         self: Arc<Self>,
         mut rx: tokio::sync::mpsc::Receiver<DeleteRequest>,
     ) -> anyhow::Result<()> {
+        let mut requests = Vec::new();
         let mut joiner = tokio::task::JoinSet::new();
+        let mut acquire_onflight = None;
 
-        while let Some(object) = rx.recv().await {
-            let permit = self.delete_semaphore.clone().acquire_owned().await?;
-            joiner.spawn(Arc::clone(&self).delete_object(object, permit));
+        loop {
+            let acquire = acquire_onflight
+                .get_or_insert_with(|| self.listing_semaphore.clone().acquire_owned());
+            let acquire = unsafe { std::pin::Pin::new_unchecked(acquire) };
+
+            tokio::select! {
+                Some(request) = rx.recv() => {
+                    requests.push(request);
+                }
+
+                permit = acquire, if !requests.is_empty() => {
+                    acquire_onflight = None;
+                    match permit {
+                        Ok(permit) => {
+                            let object = requests.swap_remove(rand::random::<u64>() as usize % requests.len());
+                            joiner.spawn(Arc::clone(&self).delete_object(object, permit));
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+
+                else => break,
+            }
 
             while let Some(tasks) = joiner.try_join_next() {
                 if let Err(err) = tasks {

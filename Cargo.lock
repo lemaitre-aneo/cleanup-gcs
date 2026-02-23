@@ -290,6 +290,7 @@ dependencies = [
  "mimalloc",
  "parse-size",
  "pretty_env_logger",
+ "rand 0.10.0",
  "scopeguard",
  "serde",
  "serde_json",
