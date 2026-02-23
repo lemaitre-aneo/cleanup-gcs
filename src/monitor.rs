@@ -63,7 +63,7 @@ impl Monitor {
                 .with_prefix("Objects")
                 .with_style(
                     indicatif::ProgressStyle::with_template(
-                        "{prefix:7} {spinner} {human_pos} objects, {live} live, {noncurrent} non-current [{per_sec}, elapsed: {elapsed}]",
+                        "{prefix:7} {spinner} {human_pos} objects, {live} live, {noncurrent} non-current [{per_sec}, elapsed: {elapsed_precise}]",
                     )?
                     .with_key(
                         "live",
@@ -80,7 +80,7 @@ impl Monitor {
             .with_finish(indicatif::ProgressFinish::AndLeave)
             .with_prefix("Size")
             .with_style(indicatif::ProgressStyle::with_template(
-                "{prefix:7} {spinner} {total_bytes} total, {bytes} non-current [elapsed: {elapsed}]",
+                "{prefix:7} {spinner} {total_bytes} total, {bytes} non-current [elapsed: {elapsed_precise}]",
             )?);
 
         object_progress.set_length(context.config.deletes_parallelism as u64);
