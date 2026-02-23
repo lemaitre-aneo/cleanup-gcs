@@ -444,7 +444,7 @@ impl ExecutionContext {
 
         loop {
             let acquire = acquire_onflight
-                .get_or_insert_with(|| self.listing_semaphore.clone().acquire_owned());
+                .get_or_insert_with(|| self.delete_semaphore.clone().acquire_owned());
             let acquire = unsafe { std::pin::Pin::new_unchecked(acquire) };
 
             tokio::select! {
