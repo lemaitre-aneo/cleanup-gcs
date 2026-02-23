@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use google_cloud_gax::paginator::Paginator;
+use google_cloud_gax::{options::RequestOptions, paginator::Paginator};
 use google_cloud_storage::{client::StorageControl, model::Object};
 use google_cloud_wkt::{FieldMask, Timestamp};
 use indicatif::MultiProgress;
@@ -450,6 +450,9 @@ impl ExecutionContext {
             );
         });
 
+        let mut request_options = RequestOptions::default();
+        request_options.set_idempotency(true);
+
         if self.config.dry_run {
             match self
                 .client
@@ -490,6 +493,7 @@ impl ExecutionContext {
             .set_bucket(&self.bucket)
             .set_object(&object.name)
             .set_generation(object.generation)
+            .with_options(request_options)
             .send()
             .await
         {
