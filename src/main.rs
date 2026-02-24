@@ -188,10 +188,14 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
 struct ListingRequest {
+    start: Option<String>,
+    end: Option<String>,
     prefix: Option<String>,
     depth: usize,
     listings_tx: tokio::sync::mpsc::Sender<ListingRequest>,
+    retry: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -277,9 +281,12 @@ impl ExecutionContext {
             tokio::sync::mpsc::channel(self.config.listings_buffer);
         self.total_listings.inc();
         listings_tx.try_send(ListingRequest {
+            start: self.config.start.clone(),
+            end: self.config.end.clone(),
             prefix: self.config.prefix.clone(),
             depth: usize::try_from(self.config.tree_depth).unwrap_or(usize::MAX),
             listings_tx: listings_tx.clone(),
+            retry: false,
         })?;
 
         std::mem::drop(listings_tx);
@@ -358,10 +365,10 @@ impl ExecutionContext {
                 .set_delimiter("/")
                 .set_include_folders_as_prefixes(false);
         }
-        if let Some(start) = &self.config.start {
+        if let Some(start) = &listing_request.start {
             listing = listing.set_lexicographic_start(start);
         }
-        if let Some(end) = &self.config.end {
+        if let Some(end) = &listing_request.end {
             listing = listing.set_lexicographic_end(end);
         }
 
@@ -393,9 +400,12 @@ impl ExecutionContext {
                         listing_request
                             .listings_tx
                             .send(ListingRequest {
+                                start: listing_request.start.clone(),
+                                end: listing_request.end.clone(),
                                 prefix: Some(prefix),
                                 depth: listing_request.depth.saturating_sub(1),
                                 listings_tx: listing_request.listings_tx.clone(),
+                                retry: false,
                             })
                             .await
                             .unwrap();
@@ -422,7 +432,18 @@ impl ExecutionContext {
                         last_object.name,
                         last_object.generation
                     );
-                    self.error_listings.inc();
+                    if listing_request.retry {
+                        self.error_listings.inc();
+                    } else {
+                        let mut retry = listing_request.clone();
+                        if last_object.name.is_empty() {
+                            retry.retry = true;
+                        } else {
+                            retry.retry = false;
+                            retry.start = Some(last_object.name.clone());
+                        }
+                        listing_request.listings_tx.send(retry).await.unwrap();
+                    }
 
                     scopeguard::ScopeGuard::into_inner(last_object);
                     return;
@@ -561,6 +582,10 @@ impl ExecutionContext {
             .with_options(request_options)
             .send()
             .await
+            && !matches!(
+                err.status().map(|status| status.code),
+                Some(google_cloud_gax::error::rpc::Code::NotFound)
+            )
         {
             let object = scopeguard::ScopeGuard::into_inner(object);
             log::error!(
